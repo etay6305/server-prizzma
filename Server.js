@@ -9,8 +9,8 @@ const { Pool } = require('pg'); // חיבור ל-PostgreSQL
 const socketIo = require('socket.io');
 const app = express();
 const ConnectionFilterPlugin = require('postgraphile-plugin-connection-filter');
-const { GraphQLObjectType, GraphQLSchema, GraphQLString, GraphQLList, GraphQLFloat,  GraphQLInt } = require('graphql');
-const { gql, GraphQLClient } = require('graphql-request'); 
+const { GraphQLObjectType, GraphQLSchema, GraphQLString, GraphQLList, GraphQLFloat,  GraphQLInt, GraphQLBoolean } = require('graphql');
+const { gql, GraphQLClient,request } = require('graphql-request'); 
 
 // יצירת שרת
 const server = http.createServer(app);
@@ -115,6 +115,7 @@ const TransmitterType = new GraphQLObjectType({
     noiseFigure: { type: GraphQLFloat},
     latitude: {type: GraphQLFloat},
     longitude: {type: GraphQLFloat},
+    awaiting: { type: GraphQLBoolean }
   },
 });
 
@@ -146,8 +147,8 @@ const OptimizationResultType = new GraphQLObjectType({
   fields: {
     result_id: { type: GraphQLString }, // מזהה ייחודי לתוצאה
     area_id: { type: GraphQLString }, // מזהה האזור (קישור ל-CoverageArea)
-    system_count: { type: GraphQLInt }, // מספר המערכות שהוצבו
-    total_coverage: { type: GraphQLFloat } // אחוז הכיסוי שהושג
+    areaName: { type: GraphQLString }, // מספר המערכות שהוצבו
+    allTransmitters: { type: GraphQLString } // אחוז הכיסוי שהושג
   },
 });
 
@@ -293,7 +294,7 @@ app.post('/submit-password', async (req, res) => {
 
 
 app.post('/change-password', async (req, res) => {
-  const { new_name, new_password, name, password } = req.body;
+  const { new_name, name, password } = req.body;
 
   // שאילתה לבדיקה אם המשתמש הישן קיים
   const CHECK_OLD_USER_EXIST = gql`
@@ -324,10 +325,10 @@ app.post('/change-password', async (req, res) => {
 
   // עדכון פרטי המשתמש
   const UPDATE_USER_DATA_MUTATION = gql`
-    mutation UpdateUser($nodeId: ID!, $new_name: String!, $new_password: String!) {
+    mutation UpdateUser($nodeId: ID!, $new_name: String!) {
       updateUser(input: { 
         nodeId: $nodeId, 
-        userPatch: { name: $new_name, password: $new_password } 
+        userPatch: { name: $new_name } 
       }) {
         user {
           name
@@ -356,7 +357,6 @@ app.post('/change-password', async (req, res) => {
     const updatedUser = await graphqlClient.request(UPDATE_USER_DATA_MUTATION, {
       nodeId,
       new_name,
-      new_password,
     });
 
     if (updatedUser.updateUser.user.name) {
@@ -518,81 +518,95 @@ app.delete("/delete-transmitter/:name", async (req, res) => {
 app.get("/radius/:name", async (req, res) => {
   const { name } = req.params;
 
-  const QUERY_TRANSMITTER_MUTATION = gql`
+  const TRANSMITTER_QUERY = gql`
     query ($name: String!) {
       allTransmitters(filter: { name: { equalTo: $name } }) {
         nodes {
-          name
-          frequencyRange
-          bandwidth
           power
-          antennaType
-          coverageRadius
           f
+          bandwidth
           antennaGain
           receiverSensitivity
           noiseFigure
-          latitude
-          longitude
         }
       }
     }
   `;
 
   try {
-    const result = await graphqlClient.request(QUERY_TRANSMITTER_MUTATION, { name });
-    const transmitter = result.allTransmitters.nodes[0];
-
+    // 1. אחזור נתונים
+    const { allTransmitters } = await graphqlClient.request(TRANSMITTER_QUERY, { name });
+    const transmitter = allTransmitters.nodes[0];
+    
     if (!transmitter) {
-      return res.status(404).send("Transmitter not found.");
+      return res.status(404).json({ error: "Transmitter not found" });
     }
 
-    // פרמטרים מהמסד
-    const power = transmitter.power; // הספק (W)
-    const antennaGain = transmitter.antennaGain; // רווח אנטנה (dB)
-    const frequency = transmitter.f * 1e6; // תדר (Hz)
-    const bandwidth = transmitter.bandwidth; // רוחב פס (Hz)
-    let receiverSensitivity = transmitter.receiverSensitivity; // רגישות מקלט (dBm)
-    const noiseFigure = transmitter.noiseFigure; // מקדם רעש (dB)
+    // 2. אסוף פרמטרים עם המרות יחידות
+    const params = {
+      power: Number(transmitter.power),               // הספק [W]
+      frequency: Number(transmitter.f) * 1e6,         // תדר [Hz] (מומר מ-MHz)
+      bandwidth: Number(transmitter.bandwidth),       // רוחב פס [Hz]
+      antennaGainTx: Number(transmitter.antennaGain), // רווח אנטנה [dB]
+      receiverSensitivity: Number(transmitter.receiverSensitivity), // [dBm]
+      noiseFigure: Number(transmitter.noiseFigure)    // [dB]
+    };
 
-    // המרת רגישות מקלט לערך שלילי אם נדרש
-    receiverSensitivity = -Math.abs(receiverSensitivity);
+    // 3. ולידציה קפדנית
+    const validationErrors = [];
+    if (params.power <= 0) validationErrors.push('הספק חייב להיות גדול מ-0');
+    if (params.frequency < 1e6) validationErrors.push('תדר חייב להיות ≥1MHz');
+    if (params.bandwidth <= 0) validationErrors.push('רוחב פס חייב להיות גדול מ-0');
+    if (params.antennaGainTx < 0) validationErrors.push('רווח אנטנה לא יכול להיות שלילי');
+    if (params.receiverSensitivity >= 0) validationErrors.push('רגישות מקלט חייבת להיות שלילית (לדוגמה: -90 עבור -90dBm)');
+    if (params.noiseFigure <= 0) validationErrors.push('מקדם רעש חייב להיות גדול מ-0');
+    
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ errors: validationErrors });
+    }
 
-    // המרת ערכים ליחידות מתאימות
-    const G_t = Math.pow(10, antennaGain / 10); // המרת dB ליחס לינארי
-    const G_r = G_t; // רווח אנטנה מקבלת זהה
-    const lambda = 3e8 / frequency; // אורך גל במטרים
+    // 4. חישובים מדעיים
+    const G_t = 10 ** (params.antennaGainTx / 10);    // רווח אנטנה לינארי
+    const lambda = 3e8 / params.frequency;            // אורך גל [מטרים]
 
-    // חישוב עוצמת הרעש (Noise Power)
-    const k = 1.38e-23; // קבוע בולצמן (J/K)
-    const T = 290; // טמפרטורה בקלווין (כ-17°C)
-    const noisePower = k * T * bandwidth; // עוצמת רעש תרמי (W)
+    // חישוב רעש תרמי כולל מקדם רעש
+    const k = 1.380649e-23;                          // קבוע בולצמן
+    const T = 290;                                    // טמפרטורת רעש
+    const noisePower = k * T * params.bandwidth * (10 ** (params.noiseFigure / 10)); // [W]
 
-    // חישוב מקדם רעש
-    const noiseFactor = Math.pow(10, noiseFigure / 10); // המרת dB ליחס לינארי
+    // המרת רגישות מקלט ל-Watts
+    const minRxPower = Math.pow(10, params.receiverSensitivity / 10) / 1000; // [W]
 
-    // יחס אות לרעש נדרש (SNR)
-    const requiredSNR = Math.pow(10, receiverSensitivity / 10); // יחס אות לרעש נדרש (W)
+    // נוסחת פריס (Friis Transmission Equation)
+    const numerator = params.power * G_t * G_t * (lambda ** 2);
+    const denominator = (4 * Math.PI) ** 2 * minRxPower;
+    const radiusMeters = Math.sqrt(numerator / denominator);
 
-    // עוצמת קליטה נדרשת כולל רעש
-    const requiredReceivedPower = noisePower * noiseFactor * requiredSNR;
+    // המרה לק"מ ועיגול
+    const radiusKm = Math.round((radiusMeters / 1000) * 100) / 100;
 
-    // אובדן נתיב חופשי (FSPL) בתנאים אידיאליים
-    const FSPL = Math.pow((4 * Math.PI * frequency) / (3e8), 2);
+    return res.json({
+      radius: radiusKm,
+      parameters: {
+        power: params.power,
+        frequency_MHz: params.frequency / 1e6,
+        bandwidth_Hz: params.bandwidth,
+        antenna_gain_dB: params.antennaGainTx,
+        receiver_sensitivity_dBm: params.receiverSensitivity,
+        noise_figure_dB: params.noiseFigure,
+        wavelength_m: lambda.toFixed(3),
+        noise_power_W: noisePower.toExponential(3)
+      }
+    });
 
-    // חישוב רדיוס הכיסוי
-    const radius = Math.sqrt((power * G_t * G_r) / (requiredReceivedPower * FSPL));
-
-    // החזרת התוצאה
-    res.status(200).json({ radius: radius.toFixed(2) }); // רדיוס במטרים
   } catch (error) {
-    console.error("Error calculating transmitter radius:", error);
-    res.status(500).send("Failed to calculate transmitter radius.");
+    console.error(`[ERROR] ${name}:`, error);
+    return res.status(500).json({ error: "שגיאה בחישוב הרדיוס" });
   }
 });
 
 app.patch("/update-transmitter", async (req, res) => {
-  const { old_name, new_name } = req.body;
+  const { name, antennaType } = req.body;
 
   const CHECK_TRANSMITTER_EXIST = gql`
     query ($name: String!) {
@@ -605,9 +619,9 @@ app.patch("/update-transmitter", async (req, res) => {
   `;
 
   const UPDATE_TRANSMITTER_DATA_MUTATION = gql`
-    mutation UpdateTransmitter($nodeId: ID!, $new_name: String!) {
+    mutation UpdateTransmitter($nodeId: ID!, $antennaType: String!) {
       updateTransmitter(
-        input: { nodeId: $nodeId, transmitterPatch: { name: $new_name } }
+        input: { nodeId: $nodeId, transmitterPatch: { antennaType: $antennaType } }
       ) {
         transmitter {
           name
@@ -618,25 +632,19 @@ app.patch("/update-transmitter", async (req, res) => {
 
   try {
     // בדיקה אם המשדר עם השם הישן קיים
-    const oldResult = await graphqlClient.request(CHECK_TRANSMITTER_EXIST, { name: old_name });
+    const oldResult = await graphqlClient.request(CHECK_TRANSMITTER_EXIST, { name: name });
     if (!oldResult.allTransmitters.nodes.length) {
       return res.status(404).send("Transmitter not found.");
     }
 
     const nodeId = oldResult.allTransmitters.nodes[0].nodeId;
 
-    // בדיקה אם השם החדש כבר קיים
-    const newResult = await graphqlClient.request(CHECK_TRANSMITTER_EXIST, { name: new_name });
-    if (newResult.allTransmitters.nodes.length) {
-      return res.status(409).send("New name already exists.");
-    }
-
-    // עדכון השם
+    // עדכון אנטנה
     const updatedResult = await graphqlClient.request(UPDATE_TRANSMITTER_DATA_MUTATION, {
       nodeId,
-      new_name,
+      antennaType,
     });
-
+    
     if (updatedResult.updateTransmitter.transmitter.name) {
       return res.status(200).json({
         message: "Transmitter updated successfully.",
@@ -1010,7 +1018,7 @@ app.get('/show-transmitters-with-coverage', async (req, res) => {
 
 
 app.patch('/AddLatAndLongtotransmitter', async (req, res) => {
-  const { name, latitude, longitude } = req.body;
+  const { name, latitude, longitude, awaiting = false } = req.body;
 
   const lat = parseFloat(latitude);
   const lon = parseFloat(longitude);
@@ -1030,10 +1038,10 @@ app.patch('/AddLatAndLongtotransmitter', async (req, res) => {
 
   // מוטציה לעדכון קואורדינטות
   const latitude_and_longitude_of_transmitter = gql`
-    mutation UpdateTransmitter($nodeId: ID!, $lat: Float!, $lon: Float!) {
+    mutation UpdateTransmitter($nodeId: ID!, $lat: Float!, $lon: Float!, $awaiting: Boolean) {
       updateTransmitter(input: { 
         nodeId: $nodeId, 
-        transmitterPatch: { latitude: $lat, longitude: $lon } 
+        transmitterPatch: { latitude: $lat, longitude: $lon, awaiting: $awaiting } 
       }) {
         transmitter {
           name
@@ -1057,6 +1065,7 @@ app.patch('/AddLatAndLongtotransmitter', async (req, res) => {
       nodeId,
       lat,
       lon,
+      awaiting,
     });
 
     res.status(200).send("Latitude and longitude updated successfully!");
@@ -1083,6 +1092,7 @@ app.get('/show-all-transmitter-on-map', async (req, res) => {
           name
           latitude
           longitude
+          awaiting
         }
       }
     }
@@ -1252,6 +1262,14 @@ app.get('/check-overlaps-by-area', async (req, res) => {
     }
   `;
 
+  // const GET_AREA_QUERY = gql`
+  //   query ($Id: Int!) {
+  //     coverageAreaByAreaId(areaId: $Id) {
+  //       name
+  //     }
+  //   }
+  // `;
+
   try {
     // שליפת משדרים והקצאות
     console.log("Fetching transmitters...");
@@ -1267,6 +1285,8 @@ app.get('/check-overlaps-by-area', async (req, res) => {
     const transmittersWithDetails = transmitters.map(transmitter => {
       const allocation = allocations.find(a => a.transmitterName === transmitter.name);
       if (allocation && allocation.areaId !== null) {
+        // let Id = allocation.areaId;
+        // const nameOfcoverage =  graphqlClient.request(GET_AREA_QUERY, { Id });
         return {
           ...transmitter,
           coverageRadius: allocation.allocatedRadius,
@@ -1321,14 +1341,220 @@ app.get('/check-overlaps-by-area', async (req, res) => {
 
 
 
-//////////////////////////// אלגוריתם אחוז כיסוי של איזור מסויים 
-const turf = require('@turf/turf');
+// //////////////////////////// אלגוריתם אחוז כיסוי של איזור מסויים 
+// const turf = require('@turf/turf');
+
+// app.get('/coverage-percentage/:areaId', async (req, res) => {
+//   const areaId = parseInt(req.params.areaId, 10);
+
+//   if (isNaN(areaId)) {
+//     return res.status(400).json({ error: 'Invalid areaId. Must be an integer.' });
+//   }
+
+//   const GET_AREA_QUERY = gql`
+//     query ($areaId: Int!) {
+//       coverageAreaByAreaId(areaId: $areaId) {
+//         latitude
+//         longitude
+//         radius
+//       }
+//     }
+//   `;
+
+//   const GET_TRANSMITTERS_QUERY = gql`
+//     query ($areaId: Int!) {
+//       allSystemAllocations(filter: { areaId: { equalTo: $areaId } }) {
+//         nodes {
+//           allocatedRadius
+//           transmitterByTransmitterName {
+//             latitude
+//             longitude
+//           }
+//         }
+//       }
+//     }
+//   `;
+
+//   try {
+//     const areaResult = await graphqlClient.request(GET_AREA_QUERY, { areaId });
+//     const area = areaResult.coverageAreaByAreaId;
+//     console.log(area);
+
+//     if (!area) {
+//       return res.status(404).json({ error: `Area with ID ${areaId} not found.` });
+//     }
+
+//     const transmittersResult = await graphqlClient.request(GET_TRANSMITTERS_QUERY, { areaId });
+//     const transmitters = transmittersResult.allSystemAllocations.nodes;
+//     console.log(transmitters);
+//     if (transmitters.length === 0) {
+//       return res.status(200).json({ areaId, coveragePercentage: 0 });
+//     }
+
+//     const areaCircle = turf.circle(
+//       [area.longitude, area.latitude],
+//       area.radius / 1000,
+//       { steps: 64, units: 'kilometers' }
+//     );
+
+//     const transmitterCircles = transmitters.map(transmitter => {
+//       const radius = transmitter.allocatedRadius;
+//       return turf.circle(
+//         [transmitter.transmitterByTransmitterName.longitude, transmitter.transmitterByTransmitterName.latitude],
+//         radius / 1000,
+//         { steps: 64, units: 'kilometers' }
+//       );
+//     });
+
+//     let unionCoverage;
+//     if (transmitterCircles.length === 1) {
+//       // אם יש רק משדר אחד, משתמשים בעיגול של המשדר
+//       unionCoverage = transmitterCircles[0];
+//     } else if (transmitterCircles.length > 1) {
+//       unionCoverage = transmitterCircles.reduce((acc, circle) => turf.union(acc, circle));
+//     } else {
+//       return res.status(200).json({ areaId, coveragePercentage: 0 });
+//     }
+//     // בדיקת חפיפה עם האזור
+//     const intersection = turf.intersect(areaCircle, unionCoverage);
+
+//     const coveredArea = intersection ? turf.area(intersection) : 0;
+//     console.log(intersection);
+//     const totalArea = turf.area(areaCircle);
+//     console.log(coveredArea / totalArea)
+//     const coveragePercentage = ((coveredArea / totalArea) * 100).toFixed(2);
+
+//     res.status(200).json({ areaId, coveragePercentage });
+//   } catch (error) {
+//     console.error('Error calculating coverage percentage:', error);
+//     res.status(500).json({ error: 'Internal Server Error' });
+//   }
+// });
+
+// app.get('/coverage-percentage/:areaId', async (req, res) => {
+//   const areaId = parseInt(req.params.areaId, 10);
+//   const SAMPLES = 10000; // מספר הנקודות לדגימה - ניתן להתאים לפי צורך
+
+//   if (isNaN(areaId)) {
+//     return res.status(400).json({ error: 'Invalid areaId' });
+//   }
+
+//   const GET_AREA_QUERY = gql`
+//     query ($areaId: Int!) {
+//       coverageAreaByAreaId(areaId: $areaId) {
+//         latitude
+//         longitude
+//         radius
+//       }
+//     }
+//   `;
+
+//   const GET_TRANSMITTERS_QUERY = gql`
+//     query ($areaId: Int!) {
+//       allSystemAllocations(filter: { areaId: { equalTo: $areaId } }) {
+//         nodes {
+//           allocatedRadius
+//           transmitterByTransmitterName {
+//             latitude
+//             longitude
+//           }
+//         }
+//       }
+//     }
+//   `;
+//   try {
+//     // קבלת נתוני אזור
+//     const areaResult = await graphqlClient.request(GET_AREA_QUERY, { areaId });
+//     const area = areaResult.coverageAreaByAreaId;
+    
+//     if (!area || !area.latitude || !area.longitude || !area.radius) {
+//       return res.status(404).json({ error: 'Area not found' });
+//     }
+
+//     // קבלת נתוני משדרים
+//     const transmittersResult = await graphqlClient.request(GET_TRANSMITTERS_QUERY, { areaId });
+//     const transmitters = transmittersResult.allSystemAllocations.nodes
+//       .map(t => ({
+//         lat: t.transmitterByTransmitterName?.latitude,
+//         lng: t.transmitterByTransmitterName?.longitude,
+//         radius: t.allocatedRadius
+//       }))
+//       .filter(t => !isNaN(t.lat) && !isNaN(t.lng) && t.radius > 0);
+
+//     // המרת קואורדינטות למטרים (הנחת ייחוס כדור הארץ)
+//     function toCartesian(lat, lng, radius) {
+//       const R = 6371000; // רדיוס כדור הארץ במטרים
+//       const φ = lat * Math.PI / 180;
+//       const λ = lng * Math.PI / 180;
+//       return {
+//         x: R * Math.cos(φ) * Math.cos(λ),
+//         y: R * Math.cos(φ) * Math.sin(λ),
+//         z: R * Math.sin(φ),
+//         radius
+//       };
+//     }
+
+//     // המרת אזור ומשדרים לקואורדינטות קרטזיות
+//     const areaCenter = toCartesian(area.latitude, area.longitude, area.radius);
+//     const transmittersCartesian = transmitters.map(t => 
+//       toCartesian(t.lat, t.lng, t.radius)
+//     );
+
+//     // פונקציית דגימה אקראית בתוך המעגל
+//     function* generatePoints(center, radius, count) {
+//       const R = radius;
+//       for (let i = 0; i < count; i++) {
+//         const angle = Math.random() * 2 * Math.PI;
+//         const r = R * Math.sqrt(Math.random());
+//         const dx = r * Math.cos(angle);
+//         const dy = r * Math.sin(angle);
+        
+//         // סיבוב לנקודה האקראית במרחב התלת-מימדי
+//         const point = {
+//           x: center.x + dx,
+//           y: center.y + dy,
+//           z: center.z
+//         };
+//         yield point;
+//       }
+//     }
+
+//     // בדיקה אם נקודה נמצאת בתוך משדר
+//     function isCovered(point, transmitters) {
+//       return transmitters.some(t => {
+//         const dx = point.x - t.x;
+//         const dy = point.y - t.y;
+//         const dz = point.z - t.z;
+//         const distance = Math.sqrt(dx*dx + dy*dy + dz*dz);
+//         return distance <= t.radius;
+//       });
+//     }
+
+//     // דגימת נקודות וחישוב הכיסוי
+//     let coveredCount = 0;
+//     const points = generatePoints(areaCenter, area.radius, SAMPLES);
+    
+//     for (const point of points) {
+//       if (isCovered(point, transmittersCartesian)) {
+//         coveredCount++;
+//       }
+//     }
+
+//     const coveragePercentage = ((coveredCount / SAMPLES) * 100).toFixed(2);
+//     res.json({ areaId, coveragePercentage });
+
+//   } catch (error) {
+//     console.error('Error:', error);
+//     res.status(500).json({ error: 'Server error' });
+//   }
+// });
 
 app.get('/coverage-percentage/:areaId', async (req, res) => {
   const areaId = parseInt(req.params.areaId, 10);
+  const SAMPLES = 10000; // ניתן להגדיל לדיוק גבוה יותר
 
   if (isNaN(areaId)) {
-    return res.status(400).json({ error: 'Invalid areaId. Must be an integer.' });
+    return res.status(400).json({ error: 'Invalid areaId' });
   }
 
   const GET_AREA_QUERY = gql`
@@ -1354,78 +1580,130 @@ app.get('/coverage-percentage/:areaId', async (req, res) => {
       }
     }
   `;
-
   try {
+    // קבלת נתוני אזור
     const areaResult = await graphqlClient.request(GET_AREA_QUERY, { areaId });
     const area = areaResult.coverageAreaByAreaId;
-    console.log(area);
-
-    if (!area) {
-      return res.status(404).json({ error: `Area with ID ${areaId} not found.` });
+    
+    if (!area || !area.latitude || !area.longitude || !area.radius) {
+      return res.status(404).json({ error: 'Area not found' });
     }
 
+    // קבלת נתוני משדרים
     const transmittersResult = await graphqlClient.request(GET_TRANSMITTERS_QUERY, { areaId });
-    const transmitters = transmittersResult.allSystemAllocations.nodes;
-    console.log(transmitters);
-    if (transmitters.length === 0) {
-      return res.status(200).json({ areaId, coveragePercentage: 0 });
+    const transmitters = transmittersResult.allSystemAllocations.nodes
+      .map(t => ({
+        lat: t.transmitterByTransmitterName?.latitude,
+        lng: t.transmitterByTransmitterName?.longitude,
+        radius: t.allocatedRadius
+      }))
+      .filter(t => !isNaN(t.lat) && !isNaN(t.lng) && t.radius > 0);
+
+    // פונקציית מרחק הוורסין
+    function haversineDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371000; // רדיוס כדור הארץ במטרים
+      const φ1 = lat1 * Math.PI / 180;
+      const φ2 = lat2 * Math.PI / 180;
+      const Δφ = (lat2 - lat1) * Math.PI / 180;
+      const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+      const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                Math.cos(φ1) * Math.cos(φ2) *
+                Math.sin(Δλ/2) * Math.sin(Δλ/2);
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     }
 
-    const areaCircle = turf.circle(
-      [area.longitude, area.latitude],
-      area.radius / 1000,
-      { steps: 64, units: 'kilometers' }
-    );
+    // יצירת נקודות דגימה אקראיות במעגל הגאוגרפי
+    function generateRandomPoint(centerLat, centerLon, radius) {
+      // המרה לקואורדינטות קוטביות עם התפלגות אחידה
+      const r = radius * Math.sqrt(Math.random());
+      const θ = Math.random() * 2 * Math.PI;
+      
+      // חישוב סטיות קואורדינטות
+      const δ = r / 6371000; // סטיות זוויתיות ברדיאנים
+      const latRad = centerLat * Math.PI / 180;
+      const lonRad = centerLon * Math.PI / 180;
 
-    const transmitterCircles = transmitters.map(transmitter => {
-      const radius = transmitter.allocatedRadius;
-      return turf.circle(
-        [transmitter.transmitterByTransmitterName.longitude, transmitter.transmitterByTransmitterName.latitude],
-        radius / 1000,
-        { steps: 64, units: 'kilometers' }
+      const newLat = Math.asin(
+        Math.sin(latRad) * Math.cos(δ) +
+        Math.cos(latRad) * Math.sin(δ) * Math.cos(θ)
       );
-    });
 
-    let unionCoverage;
-    if (transmitterCircles.length === 1) {
-      // אם יש רק משדר אחד, משתמשים בעיגול של המשדר
-      unionCoverage = transmitterCircles[0];
-    } else {
-      // בצע איחוד בין כל העיגולים
-      unionCoverage = transmitterCircles.reduce((acc, circle) => turf.union(acc, circle));
+      const newLon = lonRad + Math.atan2(
+        Math.sin(θ) * Math.sin(δ) * Math.cos(latRad),
+        Math.cos(δ) - Math.sin(latRad) * Math.sin(newLat)
+      );
+
+      return {
+        lat: newLat * 180 / Math.PI,
+        lon: newLon * 180 / Math.PI
+      };
     }
 
-    // בדיקת חפיפה עם האזור
-    const intersection = turf.intersect(areaCircle, unionCoverage);
+    // חישוב כיסוי
+    let coveredCount = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      const point = generateRandomPoint(area.latitude, area.longitude, area.radius);
+      
+      // בדיקת כיסוי ע"י משדרים
+      const isCovered = transmitters.some(t => {
+        const distance = haversineDistance(point.lat, point.lon, t.lat, t.lng);
+        return distance <= t.radius;
+      });
 
-    const coveredArea = intersection ? turf.area(intersection) : 0;
-    const totalArea = turf.area(areaCircle);
-    const coveragePercentage = ((coveredArea / totalArea) * 100).toFixed(2);
+      if (isCovered) coveredCount++;
+    }
 
-    res.status(200).json({ areaId, coveragePercentage });
+    const coveragePercentage = ((coveredCount / SAMPLES) * 100).toFixed(2);
+    res.json({ areaId, coveragePercentage });
+
   } catch (error) {
-    console.error('Error calculating coverage percentage:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 
 
+// const circleArea = (r) => Math.PI * Math.pow(r, 2);
 
+// // פונקציה למציאת תת-קבוצה אופטימלית מתוך הפתרון החמדני
+// function findOptimalSubset(transmitters, requiredArea) {
+//   const n = transmitters.length;
+//   let bestSubset = null;
+//   let bestCount = Infinity;
+//   let bestSurplus = Infinity;
+//   const totalSubsets = 1 << n; // 2^n
 
+//   for (let mask = 1; mask < totalSubsets; mask++) {
+//     let subset = [];
+//     let sumArea = 0;
+//     for (let i = 0; i < n; i++) {
+//       if (mask & (1 << i)) {
+//         subset.push(transmitters[i]);
+//         sumArea += transmitters[i].area;
+//       }
+//     }
+//     if (sumArea >= requiredArea) {
+//       const count = subset.length;
+//       const surplus = sumArea - requiredArea;
+//       // נעדיף קודם את הקבוצה עם מספר משדרים קטן יותר,
+//       // ובין קבוצות עם אותו מספר – את זו עם עודף מינימלי.
+//       if (count < bestCount || (count === bestCount && surplus < bestSurplus)) {
+//         bestSubset = subset;
+//         bestCount = count;
+//         bestSurplus = surplus;
+//       }
+//     }
+//   }
+//   return bestSubset;
+// }
 
+// app.post("/optimize-transmitters", async (req, res) => {
+//   const { name } = req.body;
+//   if (!name) return res.status(400).json({ error: "יש להעביר שם של אזור" });
 
-
-
-
-
-
-
-
-// פונקציה לחשב את Set Covering עבור האזור שנבחר
-// app.post('/optimize-transmitters', async (req, res) => {
-//   const { name } = req.body;  // קבלת שם האזור
-
+//   // השאילתות כפי שסופקו
 //   const GET_COVERAGE_AREA = gql`
 //     query ($name: String!) {
 //       allCoverageAreas(filter: { name: { equalTo: $name } }) {
@@ -1449,82 +1727,212 @@ app.get('/coverage-percentage/:areaId', async (req, res) => {
 //     }
 //   `;
 
-//   try {
-//     // שליפת נתוני האזור שנבחר לפי ה-name
-//     const areaResult = await graphqlClient.request(GET_COVERAGE_AREA, { name });
-//     const coverageArea = areaResult.allCoverageAreas.nodes[0];
-
-//     if (!coverageArea) {
-//       return res.status(404).send("Coverage area not found.");
-//     }
-
-//     // שליפת נתוני המשדרים שלא משויכים לאף אזור
-//     const allocationsResult = await graphqlClient.request(GET_SYSTEM_ALLOCATIONS);
-//     const transmitters = allocationsResult.allSystemAllocations.nodes;
-
-//     // הגדרת משתנים
-//     let selectedTransmitters = [];
-//     let uncoveredArea = coverageArea;  // נניח שהאזור מתחיל להיות לא מכוסה
-//     let coveredArea = new Set();  // נשתמש ב-Set כדי לייצג את האזורים שכוסו
-
-//     // אלגוריתם Set Covering (נמצא כמה משדרים יחד מכסים את כל האזור)
-//     while (coveredArea.size < uncoveredArea.radius) {  // נמשיך עד שכל האזור מכוסה
-//       let bestTransmitter = null;
-//       let bestCoverage = 0;
-      
-//       // בודקים איזה משדר מכסה הכי הרבה את השטח הלא מכוסה
-//       transmitters.forEach(transmitter => {
-//         const coverage = calculateCoverage(transmitter, uncoveredArea, coveredArea);
-
-//         if (coverage > bestCoverage) {
-//           bestCoverage = coverage;
-//           bestTransmitter = transmitter;
-//         }
-//       });
-
-//       if (bestTransmitter) {
-//         selectedTransmitters.push(bestTransmitter);
-//         updateCoveredArea(coveredArea, bestTransmitter);  // עדכון אזור הכיסוי
+//   const CREATE_OPTIMIZATION_TABLE = gql`
+//   mutation ($areaid: Int!, $areaName: String!, $alltransmitter: String!) {
+//     createOptimizationResult(input: {
+//       optimizationResult: {
+//         areaId: $areaid,
+//         areaName: $areaName,
+//         allTransmitters: $alltransmitter
+//       }
+//     }) {
+//       optimizationResult {
+//         areaName
+//         allTransmitters
 //       }
 //     }
+//   }
+// `;
 
-//     // החזרת המשדרים שנבחרו
-//     res.status(200).json({ selectedTransmitters });
+//  const IF_EXIST_AREA =gql`
+//   query ($areaName: String!){
+//     allOptimizationResults(filter: {areaName: {equalTo: $areaName}}) {
+//       nodes{
+//         areaName
+//       }
+//     } 
+//   }
+//  `;
 
+//  const FIND_FREQUENCY = gql`
+//  query{
+//     allTransmitters {
+//       nodes {
+//         name
+//         frequencyRange
+//       }
+//     }
+//   }
+//   `;
+
+//   try {
+//     // שליפת נתוני האזור
+//     const areaResult = await request(GRAPHQL_ENDPOINT, GET_COVERAGE_AREA, { name });
+//     const coverageArea = areaResult.allCoverageAreas.nodes[0];
+//     if (!coverageArea) return res.status(404).json({ error: "אזור כיסוי לא נמצא" });
+//     const requiredArea = circleArea(coverageArea.radius);
+
+//     // שליפת נתוני המשדרים
+//     const allocationsResult = await request(GRAPHQL_ENDPOINT, GET_SYSTEM_ALLOCATIONS);
+//     let transmitters = allocationsResult.allSystemAllocations.nodes;
+
+//     const allTrans = await request(GRAPHQL_ENDPOINT, FIND_FREQUENCY);
+//     let trans = allTrans.allTransmitters.nodes;
+//     // לכל משדר מחשבים את שטח הכיסוי שלו
+//     transmitters = transmitters.map((t) => ({
+//       ...t,
+//       area: circleArea(t.allocatedRadius),
+//       frequency: trans.find((h) => h.name == t.transmitterName).frequencyRange,
+//     }));
+
+//     // בדיקה ראשונית: האם קיים משדר אחד שמכסה את כל האזור?
+//     const completeTransmitter = transmitters.find((t) => t.area >= requiredArea);
+//     if (completeTransmitter) {
+//       return res.status(200).json({ selectedTransmitters: [completeTransmitter] });
+//     }
+
+//     // שלב 1: פתרון חמדני
+//     let selectedTransmitters = [];
+//     let currentArea = 0;
+
+//     while (currentArea < requiredArea && transmitters.length > 0) {
+//       const remaining = requiredArea - currentArea;
+//       let candidate = null;
+//       let candidateSurplus = Infinity;
+
+//       // איטרציה ראשונה: אם currentArea = 0, נבחר את המשדר עם השטח הקטן ביותר שעובר את הדרישה
+//       if (currentArea === 0) {
+//         const candidates = transmitters.filter((t) => t.area >= requiredArea);
+//         if (candidates.length > 0) {
+//           candidate = candidates.reduce((prev, curr) => (curr.area < prev.area ? curr : prev));
+//         }
+//       }
+//       // אם לא נבחר משדר באיטרציה הראשונה או ש-currentArea > 0
+//       if (!candidate) {
+//         for (const t of transmitters) {
+//           const newTotal = currentArea + t.area;
+//           if (newTotal >= requiredArea) {
+//             const surplus = newTotal - requiredArea;
+//             if (surplus < candidateSurplus) {
+//               candidateSurplus = surplus;
+//               candidate = t;
+//             }
+//           }
+//         }
+//       }
+//       // אם עדיין לא מצאנו, בחר את המשדר עם השטח הגדול ביותר
+//       if (!candidate) {
+//         candidate = transmitters.reduce((prev, curr) => (curr.area > prev.area ? curr : prev));
+//       }
+
+//       selectedTransmitters.push(candidate);
+//       currentArea += candidate.area;
+//       // הסרת המשדר הנבחר מהרשימה
+//       transmitters = transmitters.filter(
+//         (t) => t.transmitterName !== candidate.transmitterName
+//       );
+//     }
+
+//     // שלב 2: אופטימיזציה – נסה למצוא תת-קבוצה אופטימלית מתוך הפתרון החמדני
+//     const optimalSubset = findOptimalSubset(selectedTransmitters, requiredArea);
+//     if (optimalSubset) {
+//       selectedTransmitters = optimalSubset;
+//       // נחשב את השטח הכולל של הפתרון המעודכן
+//       currentArea = selectedTransmitters.reduce((sum, t) => sum + t.area, 0);
+//     }
+
+//     if (currentArea < requiredArea) {
+//       return res.status(200).json({
+//         warning: "לא הצלחנו לכסות את כל האזור עם המשדרים הזמינים",
+//         selectedTransmitters,
+//         coveredArea: currentArea,
+//         requiredArea,
+//       });
+//     }
+
+//     const check = await graphqlClient.request(IF_EXIST_AREA, {areaName: coverageArea.name});
+//     const bool = check.allOptimizationResults?.nodes[0];
+//     const selectforCreate = selectedTransmitters.map(t => t.transmitterName);
+//     if(!bool){
+//       const optim = await graphqlClient.request(CREATE_OPTIMIZATION_TABLE, {
+//         areaid: coverageArea.areaId,
+//         areaName: coverageArea.name,
+//         alltransmitter:  selectforCreate.join('-')
+//       });
+//     }
+      
+//     return res.status(200).json({
+//       selectedTransmitters,
+//       coveredArea: currentArea,
+//       requiredArea,
+//     });
 //   } catch (error) {
-//     console.error('Error during optimization:', error);
-//     res.status(500).send('Server error.');
+//     console.error("Error during optimization:", error);
+//     res.status(500).json({ error: "שגיאת שרת" });
 //   }
 // });
 
-// // פונקציה לחישוב כיסוי של משדר - על פי רדיוס
-// function calculateCoverage(transmitter, coverageArea, coveredArea) {
-//   const coverageAreaRadius = coverageArea.radius;  // רדיוס האזור
-//   const transmitterRadius = transmitter.allocatedRadius;  // רדיוס המשדר
 
-//   // חישוב שטח הכיסוי של המשדר שלא כיסה אותו קודם
-//   const newCoverage = Math.min(transmitterRadius, coverageAreaRadius - coveredArea.size);
-  
-//   // אם יש כיסוי חדש, מחזירים את השטח
-//   return newCoverage;
-// }
+// חישוב שטח עיגול
+const circleArea = (r) => Math.PI * Math.pow(r, 2);
 
-// // פונקציה לעדכון השטח שכוסה
-// function updateCoveredArea(coveredArea, transmitter) {
-//   // אנחנו מניחים שהכיסוי הוא לכל היותר לפי הרדיוס של המשדר
-//   coveredArea.add(transmitter.allocatedRadius);  // משדר מוסיף שטח לכיסוי
-// }
+// פונקציה למציאת תת-קבוצה אופטימלית מתוך הפתרון החמדני
+function findOptimalSubset(transmitters, requiredArea) {
+  const n = transmitters.length;
+  let bestSubset = null;
+  let bestCount = Infinity;
+  let bestSurplus = Infinity;
+  const totalSubsets = 1 << n; // 2^n
 
+  for (let mask = 1; mask < totalSubsets; mask++) {
+    let subset = [];
+    let sumArea = 0;
+    for (let i = 0; i < n; i++) {
+      if (mask & (1 << i)) {
+        subset.push(transmitters[i]);
+        sumArea += transmitters[i].area;
+      }
+    }
+    if (sumArea >= requiredArea) {
+      const count = subset.length;
+      const surplus = sumArea - requiredArea;
+      // נעדיף קודם את הקבוצה עם מספר משדרים קטן יותר,
+      // ובין קבוצות עם אותו מספר – את זו עם עודף מינימלי.
+      if (count < bestCount || (count === bestCount && surplus < bestSurplus)) {
+        bestSubset = subset;
+        bestCount = count;
+        bestSurplus = surplus;
+      }
+    }
+  }
+  return bestSubset;
+}
 
+// פונקציה שבודקת אם שני טווחי תדרים דוגמת "75-85" חופפים
+function rangesOverlap(range1, range2) {
+  const [low1, high1] = range1.split('-').map(Number);
+  const [low2, high2] = range2.split('-').map(Number);
+  // יש חפיפה אם הקצה התחתון של אחד <= הקצה העליון של השני
+  return Math.max(low1, low2) <= Math.min(high1, high2);
+}
 
+// פונקציה שבודקת אם יש חפיפה בין כל המשדרים בתת־קבוצה
+function hasFrequencyOverlap(transmitters) {
+  for (let i = 0; i < transmitters.length; i++) {
+    for (let j = i + 1; j < transmitters.length; j++) {
+      if (rangesOverlap(transmitters[i].frequency, transmitters[j].frequency)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
-
-
-
-
-app.post('/optimize-transmitters', async (req, res) => {
+app.post("/optimize-transmitters", async (req, res) => {
   const { name } = req.body;
+  if (!name) return res.status(400).json({ error: "יש להעביר שם של אזור" });
 
+  // השאילתות כפי שסופקו
   const GET_COVERAGE_AREA = gql`
     query ($name: String!) {
       allCoverageAreas(filter: { name: { equalTo: $name } }) {
@@ -1548,163 +1956,310 @@ app.post('/optimize-transmitters', async (req, res) => {
     }
   `;
 
+  const CREATE_OPTIMIZATION_TABLE = gql`
+    mutation ($areaid: Int!, $areaName: String!, $alltransmitter: String!) {
+      createOptimizationResult(
+        input: {
+          optimizationResult: {
+            areaId: $areaid
+            areaName: $areaName
+            allTransmitters: $alltransmitter
+          }
+        }
+      ) {
+        optimizationResult {
+          areaName
+          allTransmitters
+        }
+      }
+    }
+  `;
+
+  const IF_EXIST_AREA = gql`
+    query ($areaName: String!) {
+      allOptimizationResults(filter: { areaName: { equalTo: $areaName } }) {
+        nodes {
+          areaName
+        }
+      }
+    }
+  `;
+
+  const FIND_FREQUENCY = gql`
+    query {
+      allTransmitters {
+        nodes {
+          name
+          frequencyRange
+        }
+      }
+    }
+  `;
+
   try {
     // שליפת נתוני האזור
-    const areaResult = await graphqlClient.request(GET_COVERAGE_AREA, { name });
-    const coverageArea = areaResult.allCoverageAreas.nodes[0]; // שטח האיזור
+    const areaResult = await request(GRAPHQL_ENDPOINT, GET_COVERAGE_AREA, { name });
+    const coverageArea = areaResult.allCoverageAreas.nodes[0];
+    if (!coverageArea) return res.status(404).json({ error: "אזור כיסוי לא נמצא" });
 
-    if (!coverageArea) {
-      return res.status(404).send("Coverage area not found.");
+    // חישוב השטח הנדרש
+    const requiredArea = circleArea(coverageArea.radius);
+
+    // שליפת נתוני המשדרים (שלא שויכו לאזור)
+    const allocationsResult = await request(GRAPHQL_ENDPOINT, GET_SYSTEM_ALLOCATIONS);
+    let transmitters = allocationsResult.allSystemAllocations.nodes;
+
+    // שליפת נתוני התדרים (frequencyRange)
+    const allTrans = await request(GRAPHQL_ENDPOINT, FIND_FREQUENCY);
+    let trans = allTrans.allTransmitters.nodes;
+
+    // לכל משדר מחשבים את שטח הכיסוי שלו ומשייכים תדר
+    transmitters = transmitters.map((t) => ({
+      ...t,
+      area: circleArea(t.allocatedRadius),
+      frequency: trans.find((h) => h.name == t.transmitterName).frequencyRange,
+    }));
+
+    // בדיקה ראשונית: האם קיים משדר בודד שמכסה את כל האזור
+    const completeTransmitter = transmitters.find((t) => t.area >= requiredArea);
+    if (completeTransmitter) {
+      return res.status(200).json({ selectedTransmitters: [completeTransmitter] });
     }
 
-    // שליפת נתוני המשדרים
-    const allocationsResult = await graphqlClient.request(GET_SYSTEM_ALLOCATIONS);
-    const transmitters = allocationsResult.allSystemAllocations.nodes; // משדרים
-
+    // שלב 1: פתרון חמדני
     let selectedTransmitters = [];
-    let uncoveredArea = Math.PI * Math.pow(coverageArea.radius, 2); // שטח האזור
-    let coveredArea = 0; // שטח שכוסה
+    let currentArea = 0;
 
-    // בדיקה אם יש משדר שמכסה את כל האזור
-    let completeCoverageTransmitter = transmitters.find(transmitter => {
-      const transmitterArea = Math.PI * Math.pow(transmitter.allocatedRadius, 2);
-      return transmitterArea >= uncoveredArea;
-    });
+    while (currentArea < requiredArea && transmitters.length > 0) {
+      let candidate = null;
+      let candidateSurplus = Infinity;
 
-    if (completeCoverageTransmitter) {
-      selectedTransmitters.push(completeCoverageTransmitter);
-      return res.status(200).json({ selectedTransmitters });
+      // אם currentArea = 0, נבחר משדר שמכסה לבד בצורה המינימלית (שטח קטן שעובר את הנדרש)
+      if (currentArea === 0) {
+        const candidates = transmitters.filter((t) => t.area >= requiredArea);
+        if (candidates.length > 0) {
+          candidate = candidates.reduce((prev, curr) =>
+            curr.area < prev.area ? curr : prev
+          );
+        }
+      }
+      // אם לא נמצאה אפשרות מתאימה, נבדוק מה מצמצם surplus הכי טוב
+      if (!candidate) {
+        for (const t of transmitters) {
+          const newTotal = currentArea + t.area;
+          if (newTotal >= requiredArea) {
+            const surplus = newTotal - requiredArea;
+            if (surplus < candidateSurplus) {
+              candidateSurplus = surplus;
+              candidate = t;
+            }
+          }
+        }
+      }
+      // אם עדיין לא מצאנו, נקח את המשדר עם השטח הגדול ביותר
+      if (!candidate) {
+        candidate = transmitters.reduce((prev, curr) =>
+          curr.area > prev.area ? curr : prev
+        );
+      }
+
+      selectedTransmitters.push(candidate);
+      currentArea += candidate.area;
+      // הסרת המשדר הנבחר ממערך המועמדים
+      transmitters = transmitters.filter(
+        (t) => t.transmitterName !== candidate.transmitterName
+      );
     }
 
-    // אם אין משדר אחד שמכסה את כל האזור, נמשיך לחפש את קבוצת המשדרים
-    while (coveredArea < uncoveredArea) { // נמשיך עד שכל האזור מכוסה
-      let bestTransmitter = null;
-      let bestCoverage = 0;
+    // שלב 2: אופטימיזציה – נסה למצוא תת-קבוצה אופטימלית מתוך הפתרון החמדני
+    const optimalSubset = findOptimalSubset(selectedTransmitters, requiredArea);
+    if (optimalSubset) {
+      selectedTransmitters = optimalSubset;
+      currentArea = selectedTransmitters.reduce((sum, t) => sum + t.area, 0);
+    }
 
-      // בודקים איזה משדר מכסה הכי הרבה את השטח הלא מכוסה
-      transmitters.forEach(transmitter => {
-        let coverage = calculateCoverage(transmitter, uncoveredArea, coveredArea);
-        
-        if (coverage > bestCoverage) {
-          bestCoverage = coverage;
-          console.log(bestCoverage);
-          bestTransmitter = transmitter;
-        }
+    // אם גם אחרי האופטימיזציה חסר כיסוי – מחזירים אזהרה
+    if (currentArea < requiredArea) {
+      return res.status(200).json({
+        warning: "לא הצלחנו לכסות את כל האזור עם המשדרים הזמינים",
+        selectedTransmitters,
+        coveredArea: currentArea,
+        requiredArea,
       });
+    }
 
-      if (bestTransmitter) {
-        selectedTransmitters.push(bestTransmitter);
-        
-        console.log('bestcoverage:'+'' + bestCoverage);
-        //console.log('coveredArea' + coverageArea + 'bestCoverage' + bestCoverage + 'uncoveredArea' + uncoveredArea);
-        if(coveredArea + bestCoverage > uncoveredArea) {
-          console.log('//////////////////////////////////////////////////////////////////////////');
-          selectedTransmitters.splice(selectedTransmitters.indexOf(bestTransmitter), 1);
-          let minimaltransmittercoverage = findMinimumCoverageTransmitter(transmitter, uncoveredArea, coveredArea, bestCoverage);
-          selectedTransmitters.push(minimaltransmittercoverage);
-          console.log(selectedTransmitters);
-          // res.status(200).json({ selectedTransmitters });
-          break;
+    // שלב 3: בדיקת חפיפת תדרים – בעדיפות אחרונה
+    if (hasFrequencyOverlap(selectedTransmitters)) {
+      // אם יש חפיפה, ננסה להחליף משדר אחד או יותר בלי לפגוע בכיסוי
+      const originalSet = [...selectedTransmitters];
+      const usedNames = new Set(originalSet.map((t) => t.transmitterName));
+
+      // רשימת משדרים נוספים שאינם בשימוש כעת
+      const leftoverTransmitters = allocationsResult.allSystemAllocations.nodes
+        .map((t) => ({
+          ...t,
+          area: circleArea(t.allocatedRadius),
+          frequency: trans.find((h) => h.name == t.transmitterName)?.frequencyRange,
+        }))
+        .filter((t) => !usedNames.has(t.transmitterName));
+
+      // ננסה להחליף משדרים חופפים באחד leftover
+      for (let i = 0; i < originalSet.length; i++) {
+        const tempSet = [...originalSet];
+        for (const alt of leftoverTransmitters) {
+          tempSet[i] = alt;
+          const altArea = tempSet.reduce((sum, x) => sum + x.area, 0);
+          if (altArea >= requiredArea && !hasFrequencyOverlap(tempSet)) {
+            // מצאנו תחליף טוב, נעצור
+            selectedTransmitters = tempSet;
+            currentArea = altArea;
+            break;
+          }
         }
-        coveredArea += bestCoverage;  // עדכון השטח המכוסה
-        // מסירים את המשדר שנבחר
-        transmitters.splice(transmitters.indexOf(bestTransmitter), 1); // הסרה מהמערך
+        // אם כבר אין חפיפות – מספיק
+        if (!hasFrequencyOverlap(selectedTransmitters)) break;
       }
     }
 
-    // החזרת המשדרים שנבחרו
-    console.log(selectedTransmitters);
-    res.status(200).json({ selectedTransmitters });
+    // שלב סופי: אם נותרו חפיפות ואין תחליף – משאירים כמו שהוא
+    // בדיקת שמירה בארכיון
+    const IF_EXIST_AREA = gql`
+      query ($areaName: String!) {
+        allOptimizationResults(filter: { areaName: { equalTo: $areaName } }) {
+          nodes {
+            areaName
+          }
+        }
+      }
+    `;
+    const check = await graphqlClient.request(IF_EXIST_AREA, { areaName: coverageArea.name });
+    const bool = check.allOptimizationResults?.nodes[0];
 
+    const selectforCreate = selectedTransmitters.map((t) => t.transmitterName);
+    if (!bool) {
+      const CREATE_OPTIMIZATION_TABLE = gql`
+        mutation ($areaid: Int!, $areaName: String!, $alltransmitter: String!) {
+          createOptimizationResult(
+            input: {
+              optimizationResult: {
+                areaId: $areaid
+                areaName: $areaName
+                allTransmitters: $alltransmitter
+              }
+            }
+          ) {
+            optimizationResult {
+              areaName
+              allTransmitters
+            }
+          }
+        }
+      `;
+      await graphqlClient.request(CREATE_OPTIMIZATION_TABLE, {
+        areaid: coverageArea.areaId,
+        areaName: coverageArea.name,
+        alltransmitter: selectforCreate.join('-'),
+      });
+    }
+
+    // החזרה ללקוח
+    return res.status(200).json({
+      selectedTransmitters,
+      coveredArea: currentArea,
+      requiredArea,
+    });
   } catch (error) {
-    console.error('Error during optimization:', error);
-    res.status(500).send('Server error.');
+    console.error("Error during optimization:", error);
+    res.status(500).json({ error: "שגיאת שרת" });
   }
 });
 
-// פונקציה לחישוב כיסוי של משדר - על פי רדיוס
-function calculateCoverage(transmitter, uncoveredArea, coveredArea) {
-  const coverageAreaRadius = uncoveredArea; // שטח האזור
-  const transmitterRadius = transmitter.allocatedRadius; // רדיוס המשדר
 
-  // חישוב שטח הכיסוי של המשדר שלא כיסה אותו קודם
-  const transmitterArea = Math.PI * Math.pow(transmitterRadius, 2); // שטח הכיסוי של המשדר
-  const remainingCoverageArea = coverageAreaRadius - coveredArea; // השטח שנותר לכיסוי
-  const newCoverage = Math.min(transmitterArea, remainingCoverageArea);
-  console.log('newcoverage:' + newCoverage);
-  // אם יש כיסוי חדש, מחזירים את השטח
-  return newCoverage;
-}
 
-function findMinimumCoverageTransmitter(transmitters, uncoveredArea, coveredArea, bestCoverage) {
-  // מיון המשדרים לפי הרדיוס - מהגדול לקטן (המשדרים הגדולים יותר מכסים שטח גדול יותר)
-  transmitters = transmitters.sort((a, b) => b.allocatedRadius - a.allocatedRadius);
 
-  let bestTransmitter = null;
-  // let bestCoverage = 0;
 
-  // transmitters.forEach(transmitter => {
-  //   // חישוב כיסוי משדר
-  //   const transmitterArea = Math.PI * Math.pow(transmitter.allocatedRadius, 2); // שטח הכיסוי של המשדר
-  //   const remainingCoverageArea = uncoveredArea - coveredArea; // השטח שנותר לכיסוי
-  //   const newCoverage = Math.min(transmitterArea, remainingCoverageArea); // כיסוי שנוסף על פי המשדר הנוכחי
+const GRAPHQL_ENDPOINT0 = 'http://localhost:5000/graphql';
+app.get("/getalloptimization", async (req,res) => {
 
-  //   // אם השטח החדש מכסה את השטח הנדרש
-  //   if (coveredArea + newCoverage >= uncoveredArea) {
-  //     // אם זהו הכיסוי המינימלי ביותר
-  //     if (!bestTransmitter || newCoverage < bestCoverage) {
-  //       bestCoverage = newCoverage;
-  //       bestTransmitter = transmitter;
-  //     }
-  //   }
-  // });
-  console.log('.........................................................');
-  const min = bestCoverage;
-  transmitters.forEach(transmitter => {
-    // חישוב כיסוי משדר
-    const transmitterArea = Math.PI * Math.pow(transmitter.allocatedRadius, 2); // שטח הכיסוי של המשדר
-    const remainingCoverageArea = uncoveredArea - coveredArea; // השטח שנותר לכיסוי
-    
-    // let min = 0;
-    if (transmitterArea > remainingCoverageArea) {
-      if(transmitterArea < min) {
-        min = transmitterArea;
+  const GET_ALL_OPTIMIZATION = gql`
+    query {
+    allOptimizationResults {
+      nodes {
+        areaName
+        allTransmitters
       }
     }
-  });
+  }
+  `;
+  try{
+    const alloptimization = await request(GRAPHQL_ENDPOINT0,GET_ALL_OPTIMIZATION);
+    const optim = alloptimization.allOptimizationResults.nodes;
+    res.json(optim);
+  }catch (err){
+    console.log(err);
+  }
 
-  //return bestTransmitter;
-  return min;
-}
+});
 
+const GRAPHQL_ENDPOINT = "http://localhost:5000/graphql"; 
 
+app.post("/change-awaiting", async (req, res) => {
+  try {
+    const { name } = req.body;
 
+    if (!name) {
+      return res.status(400).json({ error: "חובה להעביר שם משדר" });
+    }
 
+    // ✅ שליפת ה-`nodeId` והערך הנוכחי של `awaiting`
+    const GET_NODE_ID = gql`
+      query ($name: String!) {
+        allTransmitters(filter: { name: { equalTo: $name } }) {
+          nodes {
+            nodeId
+            awaiting
+          }
+        }
+      }
+    `;
 
+    const response = await request(GRAPHQL_ENDPOINT, GET_NODE_ID, { name });
+    const transmitter = response.allTransmitters.nodes[0];
 
+    if (!transmitter) {
+      return res.status(404).json({ error: "משדר לא נמצא" });
+    }
 
+    const { nodeId, awaiting } = transmitter; // ✅ עכשיו יש לנו nodeId
 
+    // ✅ עדכון awaiting לערך ההפוך
+    const UPDATE_AWAITING = gql`
+      mutation ($nodeId: ID!, $awaiting: Boolean!) {
+        updateTransmitter(
+          input: {
+            nodeId: $nodeId
+            transmitterPatch: { awaiting: $awaiting }
+          }
+        ) {
+          transmitter {
+            name
+            awaiting
+          }
+        }
+      }
+    `;
 
+    const updatedData = await request(GRAPHQL_ENDPOINT, UPDATE_AWAITING, {
+      nodeId, // ✅ שולחים את ה-nodeId במקום שם
+      awaiting: !awaiting, // הופכים את המצב
+    });
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    res.json({ success: true, data: updatedData });
+  } catch (error) {
+    console.error("❌ שגיאה בבקשה:", error);
+    res.status(500).json({ error: "שגיאת שרת" });
+  }
+});
 
 
 
